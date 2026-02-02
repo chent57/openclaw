@@ -33,6 +33,7 @@ OpenClaw 的记忆系统围绕 **工作区 Markdown 文件 + SQLite 向量索引
 2. **多层记忆来源**
    - **工作区记忆**：`MEMORY.md` / `memory.md` 与 `memory/*.md`。
    - **会话记忆（可选）**：session transcript 的文本摘要（实验性）。
+   - **工具入口**：记忆工具由 memory 插件提供（默认 `memory-core`），可通过 `plugins.slots.memory = "none"` 禁用。
 
 3. **增量索引与安全重建**
    - 文件哈希用于判断是否需要重建。
@@ -73,6 +74,7 @@ OpenClaw 的记忆系统围绕 **工作区 Markdown 文件 + SQLite 向量索引
 补充说明：
 - 会话文件名可能带 `-topic-<id>` 后缀（见 `resolveSessionTranscriptPath`）。
 - 记忆索引路径可在配置中通过 `agents.defaults.memorySearch.store.path` 覆盖，支持 `{agentId}` 占位符。
+- `MEMORY.md` / `memory.md` 会作为 bootstrap 文件注入上下文；`memory/YYYY-MM-DD.md` 不会自动注入，需要通过 `memory_search`/`memory_get` 获取。
 
 ### 2.2 SQLite 数据库架构
 
@@ -223,6 +225,7 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 - `onSessionTranscriptUpdate` 只用于 **触发** session reindex，不做增量内容解析。
 - 触发条件基于 **文件大小增量** 和 **新增换行数**（`deltaBytes` / `deltaMessages`）。
 - 达到阈值后会对 해당 session 文件执行 **完整重读与重建**（并非从 offset 增量读取）。
+- 索引在后台异步执行，`memory_search` 不会阻塞等待；结果可能短暂滞后。
 
 ---
 
@@ -277,7 +280,7 @@ score = vectorWeight * vectorScore + textWeight * textScore
 - `vectorWeight` / `textWeight` 会自动归一化。
 - 候选池大小：`maxResults * candidateMultiplier`，上限 200。
 - 当 hybrid 禁用时，只返回向量结果。
-- 查询 embedding 失败会直接抛错，**不会自动降级为纯关键词搜索**。
+- 查询 embedding 失败会直接抛错，**不会自动降级为纯关键词搜索**；只有 embedding 返回全零向量时，才会走关键词结果（若 FTS 可用）。
 
 ### 4.5 Snippet 截断
 
@@ -293,6 +296,8 @@ score = vectorWeight * vectorScore + textWeight * textScore
 - `memory/*.md`：运行中的笔记、日志或每日条目。
 
 **注意**：系统不会自动生成每日记忆文件，通常由人或 memory flush 写入。
+文档层面建议“会话启动时读取今天+昨天”，但实现上并不会自动注入 daily files，只能通过 `memory_search` 拉取。
+另外，bootstrap 注入只对 subagent 做了白名单过滤；当前实现并未按群组上下文额外排除 `MEMORY.md`（是否仅在主/私聊加载需由上层策略控制）。
 
 ### 5.2 会话记忆（实验性）
 
@@ -310,12 +315,14 @@ score = vectorWeight * vectorScore + textWeight * textScore
 
 ## 6. Agent 系统集成
 
-**工具实现**：`src/agents/tools/memory-tool.ts`
+**工具实现**：`src/agents/tools/memory-tool.ts`（由 memory 插件提供，默认 `memory-core`）
 
 - `memory_search`
   - 触发搜索，返回片段 + 行号 + 评分。
 - `memory_get`
   - 读取指定文件行范围（安全限制在 memory 文件或 extraPaths）。
+  
+两者仅在 `memorySearch.enabled` 生效时注册。
 
 `memory_get` 限制：
 - 仅允许 `.md` 文件
@@ -371,6 +378,11 @@ score = vectorWeight * vectorScore + textWeight * textScore
 - 默认启用
 - 未设置 `maxEntries` 时不主动清理
 - 设置 `maxEntries` 时按 `updated_at` 删除最旧记录
+
+### 7.5 本地模型下载与缓存
+
+- `provider = "local"` 且 `modelPath` 为 `hf:`/URL 时，`node-llama-cpp` 会在首次使用时解析并下载模型到缓存目录（`modelCacheDir` 或默认缓存）。
+- `provider = "auto"` 时只有在本地文件路径存在的情况下才会优先 local；`hf:`/URL 不会触发自动选择。
 
 ---
 
@@ -430,7 +442,7 @@ score = vectorWeight * vectorScore + textWeight * textScore
       "workspace": "~/.openclaw/workspace",
       "memorySearch": {
         "enabled": true,
-        "provider": "auto",
+        "provider": "openai",
         "model": "text-embedding-3-small",
         "fallback": "none",
         "remote": {
@@ -497,7 +509,7 @@ score = vectorWeight * vectorScore + textWeight * textScore
 
 注意：
 - `cache.maxEntries` 无默认上限，示例值仅用于说明。
-- `memorySearch.provider` 支持 `openai | gemini | local`，缺省时按 `auto` 处理。
+- `memorySearch.provider` 支持 `openai | gemini | local`；未设置时按 `auto` 选择逻辑处理。
 
 ---
 
